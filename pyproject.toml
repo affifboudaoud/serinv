@@ -33,6 +33,7 @@ dependencies = [
 [project.optional-dependencies]
 cupy = ["cupy==13.2.0"]
 mpi4py = ["mpi4py"]
+jax = ["jax", "jaxlib"]
 
 [project.urls]
 repository = "https://github.com/vincent-maillou/serinv"
