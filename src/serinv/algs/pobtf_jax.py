@@ -100,6 +100,10 @@ def compute_logdet_bt_jax(L_diagonal_blocks):
     """
     Compute log determinant from BT Cholesky factor.
 
+    Uses safe log computation to prevent NaN when Cholesky diagonal elements
+    become non-positive due to FP32 precision loss. Non-positive values are
+    clamped to a small epsilon.
+
     Parameters
     ----------
     L_diagonal_blocks : array (n_blocks, block_size, block_size)
@@ -111,7 +115,9 @@ def compute_logdet_bt_jax(L_diagonal_blocks):
         log|A| = 2 * sum(log(diag(L)))
     """
     diag_vals = jnp.diagonal(L_diagonal_blocks, axis1=1, axis2=2)
-    return 2.0 * jnp.sum(jnp.log(diag_vals))
+    eps = jnp.finfo(diag_vals.dtype).eps
+    safe_diag_vals = jnp.maximum(diag_vals, eps)
+    return 2.0 * jnp.sum(jnp.log(safe_diag_vals))
 
 
 @jax.jit
