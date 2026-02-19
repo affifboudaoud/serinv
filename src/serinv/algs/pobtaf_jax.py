@@ -202,9 +202,11 @@ def _pobtaf_bwd(factorize_last_block, residuals, g):
     bar_A_lower_arrow = jnp.zeros_like(L_lower_arrow)
     bar_A_tip = jnp.zeros_like(L_tip)
 
-    # Working copies of cotangents (we accumulate into these)
-    bar_L_diag_work = bar_L_diag.copy()
-    bar_L_lower_arrow_work = bar_L_lower_arrow.copy()
+    # Read-only cotangent snapshots — these are only indexed (never
+    # written) inside the backward loop, so we keep them out of the
+    # fori_loop carry to save ~30 GB of duplicated state.
+    bar_L_diag_snap = bar_L_diag
+    bar_L_lower_arrow_snap = bar_L_lower_arrow
 
     # Accumulated cotangent for intermediate A_tip (tracks Schur complement contributions)
     bar_A_tip_accum = jnp.zeros_like(L_tip)
@@ -217,11 +219,9 @@ def _pobtaf_bwd(factorize_last_block, residuals, g):
         L_arrow_n = L_lower_arrow[-1]
 
         # Backward through: A_tip_final = A_tip_prev - L_arrow_n @ L_arrow_n^T
-        # bar_L_arrow_n += -(bar_A_tip_accum + bar_A_tip_accum^T) @ L_arrow_n
-        bar_L_arrow_n = bar_L_lower_arrow_work[-1] - (bar_A_tip_accum + bar_A_tip_accum.conj().T) @ L_arrow_n
+        bar_L_arrow_n = bar_L_lower_arrow_snap[-1] - (bar_A_tip_accum + bar_A_tip_accum.conj().T) @ L_arrow_n
 
         # Backward through: L_arrow_n = A_arrow_n @ L_nn^{-T}
-        # bar_A_arrow_n = bar_L_arrow_n @ L_nn^{-1}
         bar_A_lower_arrow = bar_A_lower_arrow.at[-1].set(
             jax.scipy.linalg.solve_triangular(
                 L_nn.conj().T, bar_L_arrow_n.conj().T, lower=False
@@ -229,15 +229,15 @@ def _pobtaf_bwd(factorize_last_block, residuals, g):
         )
 
         # Contribution to bar_L_nn from triangular solve
-        # For L_arrow_n = A_arrow_n @ L_nn^{-T}, bar_L_nn = -L_nn^{-T} @ bar_L_arrow_n^T @ L_arrow_n
         temp_arrow_n = jax.scipy.linalg.solve_triangular(
             L_nn.conj().T, bar_L_arrow_n.conj().T, lower=False
         )
         bar_L_nn_from_solve = -temp_arrow_n @ L_arrow_n
-        bar_L_diag_work = bar_L_diag_work.at[-1].add(bar_L_nn_from_solve)
+        # Update the snapshot at the last block for the loop below
+        bar_L_diag_snap = bar_L_diag_snap.at[-1].add(bar_L_nn_from_solve)
 
         # Backward through: L_nn = chol(A_nn_modified)
-        bar_A_diag = bar_A_diag.at[-1].set(_cholesky_grad(L_nn, bar_L_diag_work[-1]))
+        bar_A_diag = bar_A_diag.at[-1].set(_cholesky_grad(L_nn, bar_L_diag_snap[-1]))
 
     # Handle n_diag_blocks == 1 case (no loop iterations)
     if n_diag_blocks == 1:
@@ -245,9 +245,11 @@ def _pobtaf_bwd(factorize_last_block, residuals, g):
         return (bar_A_diag, bar_A_lower_diag, bar_A_lower_arrow, bar_A_tip)
 
     # Backward loop: i = n_diag_blocks-2 down to 0
+    # bar_L_diag_snap and bar_L_lower_arrow_snap are captured via
+    # closure — they are read-only inside the loop body.
     def bwd_body_fn(i_rev, state):
-        (bar_A_diag, bar_A_lower_diag, bar_A_lower_arrow, bar_A_tip_accum,
-         bar_L_diag_work, bar_L_lower_arrow_work) = state
+        (bar_A_diag, bar_A_lower_diag, bar_A_lower_arrow,
+         bar_A_tip_accum) = state
 
         i = n_diag_blocks - 2 - i_rev
 
@@ -255,27 +257,20 @@ def _pobtaf_bwd(factorize_last_block, residuals, g):
         L_ip1_i = L_lower_diag[i]
         L_arrow_i = L_lower_arrow[i]
 
-        # Get cotangent for A_diag[i+1] (already computed)
         bar_A_diag_ip1 = bar_A_diag[i + 1]
 
         # Backward through: A_diag[i+1] -= L_ip1_i @ L_ip1_i^T
-        # bar_L_ip1_i += -(bar_A_diag[i+1] + bar_A_diag[i+1]^T) @ L_ip1_i
         bar_L_ip1_i = bar_L_lower_diag[i] - (bar_A_diag_ip1 + bar_A_diag_ip1.conj().T) @ L_ip1_i
 
         # Backward through: A_lower_arrow[i+1] -= L_arrow_i @ L_ip1_i^H
-        # For C = A - B @ D^H:
-        #   bar_B = -bar_C @ D
-        #   bar_D = -bar_C^H @ B
         bar_A_lower_arrow_ip1 = bar_A_lower_arrow[i + 1]
-        bar_L_arrow_i = bar_L_lower_arrow_work[i] - bar_A_lower_arrow_ip1 @ L_ip1_i
+        bar_L_arrow_i = bar_L_lower_arrow_snap[i] - bar_A_lower_arrow_ip1 @ L_ip1_i
         bar_L_ip1_i = bar_L_ip1_i - bar_A_lower_arrow_ip1.conj().T @ L_arrow_i
 
         # Backward through: A_tip -= L_arrow_i @ L_arrow_i^T
-        # bar_L_arrow_i += -(bar_A_tip_accum + bar_A_tip_accum^T) @ L_arrow_i
         bar_L_arrow_i = bar_L_arrow_i - (bar_A_tip_accum + bar_A_tip_accum.conj().T) @ L_arrow_i
 
         # Backward through: L_ip1_i = A_ip1_i @ L_ii^{-T}
-        # bar_A_lower_diag[i] = bar_L_ip1_i @ L_ii^{-1}
         bar_A_lower_diag = bar_A_lower_diag.at[i].set(
             jax.scipy.linalg.solve_triangular(
                 L_ii.conj().T, bar_L_ip1_i.conj().T, lower=False
@@ -283,7 +278,6 @@ def _pobtaf_bwd(factorize_last_block, residuals, g):
         )
 
         # Backward through: L_arrow_i = A_arrow_i @ L_ii^{-T}
-        # bar_A_lower_arrow[i] = bar_L_arrow_i @ L_ii^{-1}
         bar_A_lower_arrow = bar_A_lower_arrow.at[i].set(
             jax.scipy.linalg.solve_triangular(
                 L_ii.conj().T, bar_L_arrow_i.conj().T, lower=False
@@ -291,31 +285,29 @@ def _pobtaf_bwd(factorize_last_block, residuals, g):
         )
 
         # Contributions to bar_L_ii from triangular solves
-        # For L_ip1_i = A_ip1_i @ L_ii^{-T}, bar_L_ii = -L_ii^{-T} @ bar_L_ip1_i^T @ L_ip1_i
         temp_lower = jax.scipy.linalg.solve_triangular(
             L_ii.conj().T, bar_L_ip1_i.conj().T, lower=False
         )
         bar_L_ii_from_lower = -temp_lower @ L_ip1_i
 
-        # For L_arrow_i = A_arrow_i @ L_ii^{-T}, bar_L_ii = -L_ii^{-T} @ bar_L_arrow_i^T @ L_arrow_i
         temp_arrow = jax.scipy.linalg.solve_triangular(
             L_ii.conj().T, bar_L_arrow_i.conj().T, lower=False
         )
         bar_L_ii_from_arrow = -temp_arrow @ L_arrow_i
 
-        bar_L_ii_total = bar_L_diag_work[i] + bar_L_ii_from_lower + bar_L_ii_from_arrow
+        bar_L_ii_total = bar_L_diag_snap[i] + bar_L_ii_from_lower + bar_L_ii_from_arrow
 
         # Backward through: L_ii = chol(A_ii)
         bar_A_diag = bar_A_diag.at[i].set(_cholesky_grad(L_ii, bar_L_ii_total))
 
-        return (bar_A_diag, bar_A_lower_diag, bar_A_lower_arrow, bar_A_tip_accum,
-                bar_L_diag_work, bar_L_lower_arrow_work)
+        return (bar_A_diag, bar_A_lower_diag, bar_A_lower_arrow,
+                bar_A_tip_accum)
 
-    init_state = (bar_A_diag, bar_A_lower_diag, bar_A_lower_arrow, bar_A_tip_accum,
-                  bar_L_diag_work, bar_L_lower_arrow_work)
+    init_state = (bar_A_diag, bar_A_lower_diag, bar_A_lower_arrow,
+                  bar_A_tip_accum)
 
     final_state = lax.fori_loop(0, n_diag_blocks - 1, bwd_body_fn, init_state)
-    bar_A_diag, bar_A_lower_diag, bar_A_lower_arrow, bar_A_tip_accum, _, _ = final_state
+    bar_A_diag, bar_A_lower_diag, bar_A_lower_arrow, bar_A_tip_accum = final_state
 
     # Final bar_A_tip is the accumulated cotangent
     bar_A_tip = bar_A_tip_accum
